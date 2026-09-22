@@ -1,0 +1,47 @@
+name: pkiforensics
+
+services:
+  api-a:
+    build: .
+    environment:
+      DATA_DIR: /data
+      API_PORT: 8080
+    volumes:
+      - pki-data:/data
+    ports:
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;\nsys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  api-b:
+    build: .
+    environment:
+      DATA_DIR: /data
+      API_PORT: 8080
+    volumes:
+      - pki-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;\nsys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  verify:
+    build: .
+    depends_on:
+      api-a:
+        condition: service_healthy
+      api-b:
+        condition: service_healthy
+    environment:
+      API_A_URL: http://api-a:8080
+      API_B_URL: http://api-b:8080
+    command: ["python", "-m", "acceptance.acceptance"]
+
+volumes:
+  pki-data:
