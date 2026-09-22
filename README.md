@@ -150,6 +150,23 @@ is issued by the same issuer, verifies with the issuer's key, carries EKU
 responderID (byKey SHA-1 or byName) must match the signer.  Unknown
 critical response/single-response extensions are `UNSUPPORTED`.
 
+**Delegated responder status:** a delegated responder is itself a
+certificate, so its own revocation status is adjudicated before any of its
+responses may become candidate views.  The adjudication moment is the
+response's **`producedAt`** (never the server clock, never `signed_at`),
+with the same deterministic evidence selection and the same
+`received_at <= knowledge_cutoff` gate.  The responder must be `GOOD` at
+`producedAt`; a response signed by a responder that is `REVOKED`, `STALE`,
+`UNKNOWN` or has only defective evidence is excluded
+(`RESPONDER_REVOKED` / `RESPONDER_STALE` / `RESPONDER_UNKNOWN` /
+`RESPONDER_MALFORMED_EVIDENCE`) and never becomes a candidate view for the
+certificate it speaks about.  Responder status is evaluated recursively for
+nested delegated responders; a responder whose status evidence rests on a
+circular responder reference (self or mutual) is excluded with
+`RESPONDER_CIRCULAR` and cannot establish authority.  Every object
+consulted for the responder's status is recorded in `evidence_accounting`
+and lands in the offline evidence pack.
+
 ## Path building and selection
 
 Path building runs over the **whole certificate graph** of the sealed set:
@@ -212,7 +229,11 @@ signature/authorization valid):
 Every evaluated evidence object is recorded in `evidence_accounting` with
 its disposition (`used` / `excluded`) and reason
 (`RECEIVED_AFTER_CUTOFF`, `SIGNATURE_INVALID`, `KEY_MISMATCH`,
-`RESPONDER_UNAUTHORIZED`, `UNSUPPORTED`, `NO_COMPATIBLE_BASE`, ...).
+`RESPONDER_UNAUTHORIZED`, `RESPONDER_REVOKED`, `RESPONDER_STALE`,
+`RESPONDER_UNKNOWN`, `RESPONDER_MALFORMED_EVIDENCE`, `RESPONDER_CIRCULAR`,
+`UNSUPPORTED`, `NO_COMPATIBLE_BASE`, ...).  The per-certificate conclusions
+of delegated OCSP responders (at their responses' `producedAt`) are reported
+under `responder_revocation` in the adjudication result.
 
 ## Canonicalization and tie-breaking
 

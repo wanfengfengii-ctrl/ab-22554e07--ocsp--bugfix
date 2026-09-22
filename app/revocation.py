@@ -2,9 +2,20 @@
 
 Two independent time axes (see README):
   * ``signed_at``         - when the artifact was signed; the revocation
-                            *conclusion* is always drawn at this instant.
+                            *conclusion* for path certificates is always
+                            drawn at this instant.
   * ``knowledge_cutoff``  - evidence is admissible only when its
                             client-declared ``received_at`` <= knowledge_cutoff.
+
+Delegated OCSP responders are themselves certificates: the status of a
+delegated responder is adjudicated at the response's ``producedAt`` (never at
+the server clock), with the same evidence selection and the same
+``knowledge_cutoff`` gate.  A response signed by a delegated responder that is
+not GOOD at ``producedAt`` (revoked, stale-covered, unknown, defective, or
+reachable only through a circular responder reference) is never a candidate
+view for the certificate it speaks about.  Every object consulted for the
+responder's status is recorded in ``evidence_accounting`` and touched, so it
+lands in the offline evidence pack.
 
 Deterministic evidence selection (README "Revocation evidence selection"):
   1. admissible = received in time, parses, profile-supported, in scope
@@ -437,10 +448,11 @@ def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo) -> tuple:
 
     if ocsp.sig_alg is None:
         return False, "unsupported response signature algorithm", None
-    # (a) response signed directly by the issuer
+    # (a) response signed directly by the issuer: no delegated responder to
+    # adjudicate, so the verifying certificate is reported as None.
     if issuer.key_alg is not None and _responder_id_matches(ocsp, issuer):
         if profile.verify_signature(issuer.public_key(), ocsp.sig_alg, ocsp.signature, ocsp.tbs):
-            return True, "issuer", issuer
+            return True, "issuer", None
     # (b) delegated responder: certificate embedded in the response
     for der in ocsp.responder_certs:
         try:
@@ -499,18 +511,33 @@ class RevocationEvaluator:
         self._signed_at = signed_at
         self._cutoff = knowledge_cutoff
         self._cache: dict = {}
-        self.outcomes: dict = {}               # cert_fp -> outcome
+        self.outcomes: dict = {}               # cert_fp -> outcome (at signed_at)
+        self.responder_outcomes: dict = {}     # responder cert_fp -> outcome (at producedAt)
         self.accounting: dict = {}             # evidence fp -> disposition record
         self.touched: set = set()
 
     # -- public -------------------------------------------------------------
     def status(self, cert: CertInfo, issuer: CertInfo) -> dict:
-        key = (cert.fingerprint, issuer.key_fp)
-        if key in self._cache:
-            return self._cache[key]
-        outcome = self._compute(cert, issuer)
-        self._cache[key] = outcome
+        """Revocation status of a path certificate, concluded at signed_at."""
+        outcome = self._status_at(cert, issuer, self._signed_at, frozenset())
         self.outcomes[cert.fingerprint] = outcome
+        return outcome
+
+    def _status_at(self, cert: CertInfo, issuer: CertInfo, moment: datetime,
+                   responder_stack: frozenset) -> dict:
+        """Cached revocation status of *cert* concluded at *moment*.
+
+        ``responder_stack`` holds the fingerprints of delegated responders
+        whose status is currently being adjudicated up the call chain; an OCSP
+        response whose delegated signer is already on the stack is a circular
+        reference and cannot be a candidate view.
+        """
+        key = (cert.fingerprint, issuer.key_fp, moment)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        outcome = self._compute(cert, issuer, moment, responder_stack)
+        self._cache[key] = outcome
         return outcome
 
     # -- internals ----------------------------------------------------------
@@ -527,8 +554,8 @@ class RevocationEvaluator:
         self.accounting[fp] = rec
         return rec
 
-    def _compute(self, cert: CertInfo, issuer: CertInfo) -> dict:
-        signed_at = self._signed_at
+    def _compute(self, cert: CertInfo, issuer: CertInfo, moment: datetime,
+                 responder_stack: frozenset) -> dict:
         cutoff = self._cutoff
         evaluated: dict = {}
         views: list = []
@@ -645,7 +672,7 @@ class RevocationEvaluator:
             if single is None:
                 exclude(fp, "ocsp", "SERIAL_MISMATCH", "no single response for this certificate")
                 continue
-            ok, responder_desc, _rcert = _verify_ocsp_authorization(ocsp, issuer)
+            ok, responder_desc, rcert = _verify_ocsp_authorization(ocsp, issuer)
             if not ok:
                 exclude(fp, "ocsp", "RESPONDER_UNAUTHORIZED", responder_desc, is_defective=True)
                 continue
@@ -653,6 +680,31 @@ class RevocationEvaluator:
                 exclude(fp, "ocsp", "INVALID_REVOKED_ENTRY",
                         "revoked single response without revocationTime", is_defective=True)
                 continue
+            if rcert is not None:
+                # Delegated responder: its own status is adjudicated at the
+                # response's producedAt (never the server clock), gated by the
+                # same knowledge cutoff.  A responder that is not GOOD at
+                # producedAt cannot vouch for any certificate, and circular
+                # responder references cannot establish authority.
+                self.touched.add(rcert.fingerprint)
+                if rcert.fingerprint in responder_stack:
+                    exclude(fp, "ocsp", "RESPONDER_CIRCULAR",
+                            f"delegated responder {rcert.fingerprint} rests on a circular "
+                            "responder reference", is_defective=True)
+                    continue
+                r_outcome = self._status_at(
+                    rcert, issuer, ocsp.produced_at,
+                    responder_stack | {rcert.fingerprint},
+                )
+                self.responder_outcomes[rcert.fingerprint] = r_outcome
+                if r_outcome["status"] != "GOOD":
+                    exclude(
+                        fp, "ocsp", f"RESPONDER_{r_outcome['status']}",
+                        f"delegated responder status {r_outcome['status']} at "
+                        f"producedAt {canon_time(ocsp.produced_at)}",
+                        is_defective=True,
+                    )
+                    continue
             views.append({
                 "view_id": _view_id_ocsp(fp),
                 "kind": VIEW_OCSP,
@@ -669,7 +721,7 @@ class RevocationEvaluator:
         outcome = {
             "certificate": cert.fingerprint,
             "issuer_certificate": issuer.fingerprint,
-            "signed_at": canon_time(signed_at),
+            "signed_at": canon_time(moment),
             "knowledge_cutoff": canon_time(cutoff),
         }
         if not views:
@@ -711,14 +763,14 @@ class RevocationEvaluator:
             if entry is not None:
                 revoked_at, reason = entry
 
-        if revoked_at is not None and revoked_at <= signed_at:
+        if revoked_at is not None and revoked_at <= moment:
             outcome["status"] = "REVOKED"
             outcome["revocation_time"] = canon_time(revoked_at)
             if reason:
                 outcome["revocation_reason"] = reason
             return outcome
-        if view["as_of"] >= signed_at or (
-            view["next_update"] is not None and view["next_update"] >= signed_at
+        if view["as_of"] >= moment or (
+            view["next_update"] is not None and view["next_update"] >= moment
         ):
             outcome["status"] = "GOOD"
             return outcome

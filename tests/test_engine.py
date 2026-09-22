@@ -200,7 +200,7 @@ def test_ocsp_direct_and_delegated():
     assert res["verdict"] == "VALID", dumps(res["decision"]).decode()
     assert res["revocation"][sha256_hex(leaf.der)]["status"] == "GOOD"
 
-    # delegated responder
+    # delegated responder (unrevoked, with CRL evidence covering producedAt)
     bag2 = Bag()
     root2, inter2, leaf2 = simple_chain(bag2, eku=["1.3.6.1.5.5.7.3.3"],
                                         with_inter_crl=False)
@@ -208,6 +208,9 @@ def test_ocsp_direct_and_delegated():
                           not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.9"],
                           key_usage=("digitalSignature",))
     bag2.cert(responder)
+    # the issuer CRL is silent about the responder and covers producedAt
+    bag2.add(make_crl(inter2, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                      next_update=T("2024-07-01")), "crl", EARLY)
     ocsp2 = make_ocsp(inter2, serial=leaf2.cert.serial_number, status="good",
                       this_update=T("2024-05-20"), next_update=T("2024-06-20"),
                       responder=responder)

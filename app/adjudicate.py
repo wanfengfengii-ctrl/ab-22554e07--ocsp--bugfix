@@ -286,6 +286,10 @@ class _Engine:
         revocation = {
             fp: evaluator.outcomes[fp] for fp in sorted(evaluator.outcomes.keys())
         }
+        responder_revocation = {
+            fp: evaluator.responder_outcomes[fp]
+            for fp in sorted(evaluator.responder_outcomes.keys())
+        }
         accounting = sorted(
             evaluator.accounting.values(), key=lambda r: (r["fingerprint"], r["reason"])
         )
@@ -304,6 +308,7 @@ class _Engine:
             "artifact_signature": artifact,
             "decision": decision,
             "revocation": revocation,
+            "responder_revocation": responder_revocation,
             "evidence_accounting": accounting,
             "summary": summary,
         }

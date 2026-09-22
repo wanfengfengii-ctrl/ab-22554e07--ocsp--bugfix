@@ -289,7 +289,7 @@ _REASON_ATTR = {
 def make_ocsp(issuer: Entity, *, serial: int, status: str, this_update: datetime,
               next_update: datetime | None, revocation_time=None, reason=None,
               responder: Entity | None = None, hash_alg=None,
-              responder_encoding="hash") -> bytes:
+              responder_encoding="hash", produced_at: datetime | None = None) -> bytes:
     from cryptography.x509.ocsp import (
         OCSPCertStatus,
         OCSPResponderEncoding,
@@ -336,9 +336,16 @@ def make_ocsp(issuer: Entity, *, serial: int, status: str, this_update: datetime
         # cryptography's OCSP builder cannot do RSA-PSS; sign PKCS#1 then
         # rewrite the signatureAlgorithm to RSASSA-PSS (fixture surgery).
         resp = builder.sign(resp_entity.key, alg)
-        return _pss_ocsp_surgery(resp.public_bytes(serialization.Encoding.DER),
-                                 resp_entity.key)
-    return builder.sign(resp_entity.key, alg).public_bytes(serialization.Encoding.DER)
+        der = _pss_ocsp_surgery(resp.public_bytes(serialization.Encoding.DER),
+                                resp_entity.key)
+    else:
+        der = builder.sign(resp_entity.key, alg).public_bytes(serialization.Encoding.DER)
+    # cryptography always stamps producedAt with the wall clock at signing.
+    # Adjudication never trusts the server clock, so fixtures pin an explicit,
+    # evidence-coherent producedAt (default: the single response's thisUpdate).
+    return _set_ocsp_produced_at(
+        der, produced_at or this_update, resp_entity.key
+    )
 
 
 def _issuer_hashes(issuer: Entity, hash_alg) -> tuple:
@@ -409,6 +416,63 @@ def _pss_ocsp_surgery(der: bytes, key) -> bytes:
     signature = sign_data(key, tbs)
     new_basic = _der_encode(
         0x30, tbs + _PSS_ALG + _der_encode(0x03, b"\x00" + signature) + certs_part
+    )
+    response_bytes = _der_encode(0x30, oid_part + _der_encode(0x04, new_basic))
+    return _der_encode(0x30, status_part + _der_encode(0xA0, response_bytes))
+
+
+def _set_ocsp_produced_at(der: bytes, produced_at: datetime, key) -> bytes:
+    """Rewrite a successful OCSP response's producedAt and re-sign it.
+
+    cryptography stamps producedAt with the builder's wall clock, which is
+    meaningless for offline historical adjudication; fixtures pin an
+    evidence-coherent producedAt.  The TBS ResponseData is edited in DER
+    (version [0] OPTIONAL, responderID, producedAt GeneralizedTime, ...) and
+    the BasicOCSPResponse signature is recomputed with *key* (RSA responses
+    already carry the RSASSA-PSS algorithm identifier).  Test tooling only.
+    """
+    # walk to the BasicOCSPResponse OCTET STRING
+    _, _, p = _der_read(der, 0)
+    assert der[p] == 0x0A and der[p + 2] == 0x00, "expected successful status"
+    status_part = der[p : p + 3]
+    _, _, p2 = _der_read(der, p + 3)          # [0] EXPLICIT
+    _, _, p3 = _der_read(der, p2)             # SEQUENCE (ResponseBytes)
+    _, oid_len, p4 = _der_read(der, p3)       # responseType OID
+    oid_part = der[p3 : p4 + oid_len]
+    _, oct_len, p5 = _der_read(der, p4 + oid_len)
+    basic = der[p5 : p5 + oct_len]
+    # BasicOCSPResponse ::= SEQUENCE { tbs, sigAlg, signature, certs [0] OPT }
+    _, _, bp = _der_read(basic, 0)
+    _, tbs_len, bp2 = _der_read(basic, bp)
+    tbs = basic[bp : bp2 + tbs_len]
+    pos = bp2 + tbs_len
+    sa_start = pos
+    _, sa_len, sp = _der_read(basic, pos)     # signatureAlgorithm TLV
+    sigalg_tlv = basic[sa_start : sp + sa_len]
+    pos = sp + sa_len
+    _, sig_len, sp2 = _der_read(basic, pos)   # signature BIT STRING
+    pos = sp2 + sig_len
+    certs_part = basic[pos:]                  # optional [0] certificates
+    # ResponseData ::= SEQUENCE { version [0] EXPLICIT INTEGER OPTIONAL,
+    #   responderID, producedAt GeneralizedTime, responses [0], ... }
+    _, _, tp = _der_read(tbs, 0)
+    content = tbs[tp:]
+    i = 0
+    if content[i] == 0xA0:                    # optional version
+        _, vlen, j = _der_read(content, i)
+        i = j + vlen
+    assert content[i] in (0xA1, 0xA2), "expected responderID"
+    _, rid_len, j = _der_read(content, i)
+    i = j + rid_len
+    tag, gt_len, j = _der_read(content, i)
+    assert tag == 0x18, "expected producedAt GeneralizedTime"
+    gt = produced_at.astimezone(UTC).strftime("%Y%m%d%H%M%SZ").encode("ascii")
+    new_content = content[:i] + _der_encode(0x18, gt) + content[j + gt_len:]
+    new_tbs = _der_encode(0x30, new_content)
+    signature = sign_data(key, new_tbs)
+    new_basic = _der_encode(
+        0x30,
+        new_tbs + sigalg_tlv + _der_encode(0x03, b"\x00" + signature) + certs_part,
     )
     response_bytes = _der_encode(0x30, oid_part + _der_encode(0x04, new_basic))
     return _der_encode(0x30, status_part + _der_encode(0xA0, response_bytes))
