@@ -200,7 +200,8 @@ def test_ocsp_direct_and_delegated():
     assert res["verdict"] == "VALID", dumps(res["decision"]).decode()
     assert res["revocation"][sha256_hex(leaf.der)]["status"] == "GOOD"
 
-    # delegated responder
+    # delegated responder: the responder certificate must itself be GOOD at
+    # the response's producedAt, so give it an in-window empty issuer CRL.
     bag2 = Bag()
     root2, inter2, leaf2 = simple_chain(bag2, eku=["1.3.6.1.5.5.7.3.3"],
                                         with_inter_crl=False)
@@ -208,13 +209,25 @@ def test_ocsp_direct_and_delegated():
                           not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.9"],
                           key_usage=("digitalSignature",))
     bag2.cert(responder)
+    produced = T("2024-05-25")
     ocsp2 = make_ocsp(inter2, serial=leaf2.cert.serial_number, status="good",
                       this_update=T("2024-05-20"), next_update=T("2024-06-20"),
-                      responder=responder)
+                      responder=responder, produced_at=produced)
     bag2.add(ocsp2, "ocsp", EARLY)
+    # responder status evidence at producedAt: empty CRL covering the window
+    # but older than the leaf's OCSP view, so the leaf still selects OCSP
+    bag2.add(make_crl(inter2, entries=[], crl_number=2,
+                      this_update=T("2024-05-01"), next_update=T("2024-07-01")),
+             "crl", EARLY)
     res2 = adjudicate(bag2, sha256_hex(leaf2.der), [sha256_hex(root2.der)],
                       leaf_key=leaf2.key)
     assert res2["verdict"] == "VALID", dumps(res2["decision"]).decode()
+    leaf_out = res2["revocation"][sha256_hex(leaf2.der)]
+    assert leaf_out["status"] == "GOOD"
+    assert leaf_out["selected_view"].startswith("ocsp:")
+    r_out = {o["certificate"]: o for o in res2["responder_revocation"]}
+    assert r_out[sha256_hex(responder.der)]["status"] == "GOOD"
+    assert r_out[sha256_hex(responder.der)]["evaluated_at"] == "2024-05-25T00:00:00Z"
 
 
 def test_ocsp_revoked_and_bad_signature():

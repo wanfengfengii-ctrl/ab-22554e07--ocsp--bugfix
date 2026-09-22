@@ -289,7 +289,7 @@ _REASON_ATTR = {
 def make_ocsp(issuer: Entity, *, serial: int, status: str, this_update: datetime,
               next_update: datetime | None, revocation_time=None, reason=None,
               responder: Entity | None = None, hash_alg=None,
-              responder_encoding="hash") -> bytes:
+              responder_encoding="hash", produced_at: datetime | None = None) -> bytes:
     from cryptography.x509.ocsp import (
         OCSPCertStatus,
         OCSPResponderEncoding,
@@ -336,9 +336,16 @@ def make_ocsp(issuer: Entity, *, serial: int, status: str, this_update: datetime
         # cryptography's OCSP builder cannot do RSA-PSS; sign PKCS#1 then
         # rewrite the signatureAlgorithm to RSASSA-PSS (fixture surgery).
         resp = builder.sign(resp_entity.key, alg)
-        return _pss_ocsp_surgery(resp.public_bytes(serialization.Encoding.DER),
-                                 resp_entity.key)
-    return builder.sign(resp_entity.key, alg).public_bytes(serialization.Encoding.DER)
+        der = resp.public_bytes(serialization.Encoding.DER)
+        if produced_at is not None:
+            # while the response is still PKCS#1-signed it is cheapest to
+            # rewrite producedAt here; the PSS surgery re-signs the new tbs
+            der = _set_ocsp_produced_at(der, resp_entity.key, produced_at)
+        return _pss_ocsp_surgery(der, resp_entity.key)
+    der = builder.sign(resp_entity.key, alg).public_bytes(serialization.Encoding.DER)
+    if produced_at is not None:
+        der = _set_ocsp_produced_at(der, resp_entity.key, produced_at)
+    return der
 
 
 def _issuer_hashes(issuer: Entity, hash_alg) -> tuple:
@@ -373,6 +380,86 @@ def _der_encode(tag: int, content: bytes) -> bytes:
         b = n.to_bytes((n.bit_length() + 7) // 8, "big")
         hdr = bytes([0x80 | len(b)]) + b
     return bytes([tag]) + hdr + content
+
+
+def _der_elements(content: bytes):
+    """Yield (tag, start, value_start, end) for each top-level TLV."""
+    p = 0
+    out = []
+    while p < len(content):
+        start = p
+        tag = content[p]
+        p += 1
+        length = content[p]
+        p += 1
+        if length & 0x80:
+            n = length & 0x7F
+            length = int.from_bytes(content[p : p + n], "big")
+            p += n
+        out.append((tag, start, p, p + length))
+        p += length
+    return out
+
+
+def _generalized_time(dt: datetime) -> bytes:
+    dt = dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+    return dt.strftime("%Y%m%d%H%M%SZ").encode()
+
+
+def _set_ocsp_produced_at(der: bytes, key, produced_at: datetime) -> bytes:
+    """Rewrite producedAt of a BasicOCSPResponse and re-sign it.
+
+    The cryptography builder hard-codes producedAt to the current time; the
+    service must instead adjudicate responder status at an arbitrary
+    historical instant.  Test tooling only.  The signature algorithm is
+    preserved as built (RSA responses are still PKCS#1 at this point; the
+    PSS surgery runs afterwards).
+    """
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+
+    _, _, p = _der_read(der, 0)
+    status_part = der[p : p + 3]
+    _, _, p2 = _der_read(der, p + 3)          # [0] EXPLICIT
+    _, _, p3 = _der_read(der, p2)             # SEQUENCE (ResponseBytes)
+    _, oid_len, p4 = _der_read(der, p3)       # responseType OID
+    oid_part = der[p3 : p4 + oid_len]
+    _, oct_len, p5 = _der_read(der, p4 + oid_len)
+    basic = der[p5 : p5 + oct_len]
+    _, _, bp = _der_read(basic, 0)
+    _, tbs_len, bp2 = _der_read(basic, bp)
+    tbs = basic[bp : bp2 + tbs_len]
+    pos = bp2 + tbs_len
+    _, sa_len, sp = _der_read(basic, pos)
+    sig_alg_tlv = basic[pos : sp + sa_len]
+    pos = sp + sa_len
+    _, sig_len, sp2 = _der_read(basic, pos)
+    pos = sp2 + sig_len
+    certs_part = basic[pos:]
+
+    # ResponseData: the only top-level GeneralizedTime (0x18) is producedAt
+    _, _, tbs_inner_start = _der_read(tbs, 0)
+    elems = _der_elements(tbs[tbs_inner_start:])
+    prod = [e for e in elems if e[0] == 0x18]
+    assert len(prod) == 1, "expected exactly one top-level GeneralizedTime"
+    _tag, ps, pvs, pe = prod[0]
+    abs_vs = tbs_inner_start + pvs
+    abs_end = tbs_inner_start + pe
+    new_value = _generalized_time(produced_at)
+    new_tbs_inner = tbs[tbs_inner_start:abs_vs] + new_value + tbs[abs_end:]
+    new_tbs = _der_encode(0x30, new_tbs_inner)
+
+    if isinstance(key, _rsa.RSAPrivateKey):
+        signature = key.sign(new_tbs, padding.PKCS1v15(), hashes.SHA256())
+    elif isinstance(key, ec.EllipticCurvePrivateKey):
+        signature = key.sign(new_tbs, ec.ECDSA(hashes.SHA256()))
+    else:
+        signature = key.sign(new_tbs)
+    new_basic = _der_encode(
+        0x30, new_tbs + sig_alg_tlv + _der_encode(0x03, b"\x00" + signature)
+        + certs_part
+    )
+    response_bytes = _der_encode(0x30, oid_part + _der_encode(0x04, new_basic))
+    return _der_encode(0x30, status_part + _der_encode(0xA0, response_bytes))
 
 
 # RSASSA-PSS AlgorithmIdentifier: sha256, MGF-1-sha256, salt length 32

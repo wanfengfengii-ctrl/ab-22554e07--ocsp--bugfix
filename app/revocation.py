@@ -2,9 +2,20 @@
 
 Two independent time axes (see README):
   * ``signed_at``         - when the artifact was signed; the revocation
-                            *conclusion* is always drawn at this instant.
+                            *conclusion* for path certificates is always
+                            drawn at this instant.
   * ``knowledge_cutoff``  - evidence is admissible only when its
                             client-declared ``received_at`` <= knowledge_cutoff.
+
+Delegated OCSP responders are themselves certificates: before a response
+signed by one may endorse anything, the responder certificate's own status
+must be adjudicated - not at ``signed_at`` and never at "now", but at the
+response's ``producedAt`` (RFC 6960), using the same evidence set and the
+same ``knowledge_cutoff``.  That adjudication is recursive: a response used
+to vouch for a responder must itself be signed by an authorized responder,
+and responder-authorization cycles (a responder vouching for itself, or two
+responders vouching for each other) are cut, so revoked responders cannot be
+resurrected by their own signatures.
 
 Deterministic evidence selection (README "Revocation evidence selection"):
   1. admissible = received in time, parses, profile-supported, in scope
@@ -27,7 +38,7 @@ from cryptography.x509.oid import ExtensionOID
 
 from . import profile
 from .canonical import canon_time, parse_time, sha256_hex
-from .errors import ParseError
+from .errors import ParseError, ResourceExhausted
 from .pki import EKU_OCSP_SIGNING, CertInfo
 
 # CRL entry reason names (RFC 5280 5.3.1)
@@ -428,20 +439,40 @@ def _responder_id_matches(ocsp: OcspInfo, cert: CertInfo) -> bool:
     return False
 
 
-def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo) -> tuple:
+def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo, evaluator,
+                               path: tuple) -> tuple:
     """Validate the OCSP responder authorization chain.
 
-    Returns (ok, responder_description, verifying_cert_or_None).
+    A delegated responder is itself certified by *issuer*; its signature on
+    this response is trustworthy only when the responder certificate is
+    GOOD at the response's ``producedAt`` (never at ``signed_at`` and never
+    at the current time).  That status is adjudicated through *evaluator*,
+    which recursively applies these same checks to any OCSP evidence used
+    for the responder.
+
+    *path* holds the fingerprints of the certificates on the current
+    endorsement chain (the certificate whose revocation is being evaluated
+    is its last element).  A response whose signer is already on the path is
+    a self/mutual endorsement cycle and cannot authorize anything.
+
+    Returns ``(ok, responder_description, responder_cert_or_None,
+    fail_reason_or_None)`` where *fail_reason* distinguishes a revoked
+    responder (``RESPONDER_REVOKED``) from other authorization failures
+    (``RESPONDER_UNAUTHORIZED``).
     """
     from .pki import parse_certificate
 
     if ocsp.sig_alg is None:
-        return False, "unsupported response signature algorithm", None
-    # (a) response signed directly by the issuer
+        return False, "unsupported response signature algorithm", None, \
+            "RESPONDER_UNAUTHORIZED"
+    # (a) response signed directly by the issuer: no responder certificate to
+    #     adjudicate.
     if issuer.key_alg is not None and _responder_id_matches(ocsp, issuer):
         if profile.verify_signature(issuer.public_key(), ocsp.sig_alg, ocsp.signature, ocsp.tbs):
-            return True, "issuer", issuer
+            return True, "issuer", issuer, None
     # (b) delegated responder: certificate embedded in the response
+    revoked_note = None
+    cycle_note = None
     for der in ocsp.responder_certs:
         try:
             rcert = parse_certificate(der)
@@ -461,9 +492,38 @@ def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo) -> tuple:
             issuer.public_key(), rcert.sig_alg, rcert.cert.signature, rcert.cert.tbs_certificate_bytes
         ):
             continue
+        # the responder certificate (if archived as its own object) and every
+        # piece of evidence its status draws on belong in the touched set and
+        # hence in the offline review object set
+        evaluator.note_responder_cert(rcert.fingerprint)
+        evaluator.spend_responder_edge()
+        if rcert.fingerprint in path:
+            # self- or mutually-endorsing responder chain: cut the cycle; this
+            # edge carries no authority regardless of what the response says
+            evaluator.mark_responder_cycle()
+            cycle_note = (
+                f"responder {rcert.fingerprint} endorses itself along the "
+                "authorization path"
+            )
+            continue
+        outcome = evaluator.responder_status(
+            rcert, issuer, ocsp.produced_at, path,
+        )
+        if outcome["status"] != "GOOD":
+            revoked_note = (
+                f"delegated responder {rcert.fingerprint} status "
+                f"{outcome['status']} at producedAt"
+            )
+            if outcome["status"] == "REVOKED":
+                return False, revoked_note, None, "RESPONDER_REVOKED"
+            continue
         if profile.verify_signature(rcert.public_key(), ocsp.sig_alg, ocsp.signature, ocsp.tbs):
-            return True, f"delegated:{rcert.fingerprint}", rcert
-    return False, "no authorized responder", None
+            return True, f"delegated:{rcert.fingerprint}", rcert, None
+    if revoked_note is not None:
+        return False, revoked_note, None, "RESPONDER_UNAUTHORIZED"
+    if cycle_note is not None:
+        return False, cycle_note, None, "RESPONDER_CYCLE"
+    return False, "no authorized responder", None, "RESPONDER_UNAUTHORIZED"
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +532,18 @@ def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo) -> tuple:
 
 VIEW_CRL = "crl"
 VIEW_OCSP = "ocsp"
+
+# Maximum nesting depth of delegated-responder endorsements, aligned with
+# the candidate path length.  Beyond this the authorization chain is
+# rejected deterministically; realizable responder chains are only a level
+# or two deep, and the bound keeps the recursive evaluator well within the
+# interpreter's recursion limit.
+MAX_RESPONDER_CHAIN = 32
+
+# Total responder-authorization edges evaluated per adjudication, a hard cap
+# against pathological (crafted) dense responder graphs.  Realistic evidence
+# sets use a handful; exhausting the budget is a deterministic resource error.
+MAX_RESPONDER_EDGES = 65536
 
 
 def _view_id_crl(fp: str) -> str:
@@ -487,7 +559,13 @@ def _view_id_ocsp(fp: str) -> str:
 
 
 class RevocationEvaluator:
-    """Computes per-certificate revocation outcomes for one adjudication."""
+    """Computes per-certificate revocation outcomes for one adjudication.
+
+    Path certificates are adjudicated at ``signed_at``.  A delegated OCSP
+    responder certificate is instead adjudicated at the ``producedAt`` of
+    the response it signs (RFC 6960); both conclusions stay bounded by the
+    single request ``knowledge_cutoff`` - the wall clock is never read.
+    """
 
     def __init__(self, crl_index: dict, ocsp_fps: list, metas: dict,
                  get_crl, get_ocsp, signed_at: datetime, knowledge_cutoff: datetime):
@@ -499,18 +577,134 @@ class RevocationEvaluator:
         self._signed_at = signed_at
         self._cutoff = knowledge_cutoff
         self._cache: dict = {}
-        self.outcomes: dict = {}               # cert_fp -> outcome
+        self._tainted_keys: set = set()
+        # path-independent conclusions: once a (cert, issuer, evaluatedAt) is
+        # GOOD or REVOKED on one endorsement path, every admissible path over
+        # the same evidence set reaches the same conclusion (a view's verdict
+        # does not depend on how the responder was reached).  Non-terminal
+        # states (UNKNOWN/STALE/MALFORMED) remain path-sensitive because they
+        # can result purely from a cycle cut.
+        self._conclusion: dict = {}
+        self.outcomes: dict = {}               # cert_fp -> outcome (at signed_at)
+        self.responder_outcomes: dict = {}     # (cert_fp, evaluated_at) -> outcome
         self.accounting: dict = {}             # evidence fp -> disposition record
         self.touched: set = set()
+        # per-call flags: True when the current _compute subtree rejected at
+        # least one responder edge because of an endorsement cycle
+        self._cycle_stack: list = []
+        self._responder_edges = 0
+
+    def spend_responder_edge(self) -> None:
+        """Account one examined delegated-responder candidate; bounded so a
+        crafted dense responder graph cannot make adjudication explode."""
+        self._responder_edges += 1
+        if self._responder_edges > MAX_RESPONDER_EDGES:
+            raise ResourceExhausted(
+                f"responder authorization exceeded budget of "
+                f"{MAX_RESPONDER_EDGES} edges"
+            )
+
+    def mark_responder_cycle(self) -> None:
+        """Record that a self/mutual endorsement edge was cut in the current
+        responder-authorization subtree."""
+        if self._cycle_stack:
+            self._cycle_stack[-1] = True
 
     # -- public -------------------------------------------------------------
     def status(self, cert: CertInfo, issuer: CertInfo) -> dict:
-        key = (cert.fingerprint, issuer.key_fp)
-        if key in self._cache:
-            return self._cache[key]
-        outcome = self._compute(cert, issuer)
-        self._cache[key] = outcome
-        self.outcomes[cert.fingerprint] = outcome
+        """Revocation of a path certificate, concluded at ``signed_at``."""
+        outcome = self._status(cert, issuer, self._signed_at, (), top_level=True)
+        return self._as_top_level(outcome)
+
+    def responder_status(self, cert: CertInfo, issuer: CertInfo,
+                         evaluated_at: datetime, ancestors: tuple) -> dict:
+        """Revocation of a delegated responder certificate, concluded at the
+        OCSP response's ``producedAt``.  *ancestors* are the certificates
+        already on the endorsement path (including the subject of the
+        response this responder signs); repeating one closes a cycle.
+        """
+        return self._status(cert, issuer, evaluated_at, ancestors)
+
+    @staticmethod
+    def _as_top_level(outcome: dict) -> dict:
+        """Project a responder-style record (``evaluated_at``) onto the
+        top-level path-certificate shape (``signed_at``)."""
+        out = dict(outcome)
+        if "evaluated_at" in out:
+            out["signed_at"] = out.pop("evaluated_at")
+        out.pop("responder_authorization", None)
+        out.pop("authorization_too_deep", None)
+        out.pop("cycle_cut", None)
+        return out
+
+    def note_responder_cert(self, fp: str) -> None:
+        """Ensure an archived responder certificate joins the touched set."""
+        self.touched.add(fp)
+
+    # -- internals ----------------------------------------------------------
+    def _status(self, cert: CertInfo, issuer: CertInfo,
+                evaluated_at: datetime, ancestors: tuple, top_level: bool = False) -> dict:
+        """*ancestors* is the tuple of certificates already on the responder
+        endorsement path above *cert* (the vouched-for certificate of each
+        OCSP authorization edge).  The full path appends *cert*; it is
+        consulted at every delegated-responder edge so a response vouched for
+        by a responder already on the path (self or mutual endorsement) is
+        rejected as a cycle.
+
+        A conclusion reached without rejecting any cyclic edge is independent
+        of the endorsement path and is memoized globally; a subtree that did
+        cut a cycle can reach a different verdict on another path, so its
+        result stays keyed to the visited responder set.
+        """
+        ckey = (cert.fingerprint, issuer.key_fp, evaluated_at)
+        firm = self._conclusion.get(ckey)
+        if firm is not None:
+            outcome = firm
+        elif len(ancestors) >= MAX_RESPONDER_CHAIN:
+            # reached only via an unusually long endorsement chain; a shorter
+            # path could still settle this responder, so do not firm-cache and
+            # taint the enclosing subtree
+            if self._cycle_stack:
+                self._cycle_stack[-1] = True
+            outcome = {
+                "certificate": cert.fingerprint,
+                "issuer_certificate": issuer.fingerprint,
+                "evaluated_at": canon_time(evaluated_at),
+                "knowledge_cutoff": canon_time(self._cutoff),
+                "status": "UNKNOWN",
+                "selected_view": None,
+                "selected_evidence": [],
+                "evaluated_evidence": [],
+                "authorization_too_deep": True,
+            }
+        else:
+            path = ancestors + (cert.fingerprint,)
+            key = ckey + (frozenset(path),)
+            cached = self._cache.get(key)
+            if cached is not None:
+                outcome = cached
+                if key in self._tainted_keys and self._cycle_stack:
+                    self._cycle_stack[-1] = True
+            else:
+                self._cycle_stack.append(False)
+                outcome = self._compute(cert, issuer, evaluated_at, path)
+                tainted = self._cycle_stack.pop()
+                if tainted and self._cycle_stack:
+                    self._cycle_stack[-1] = True
+                self._cache[key] = outcome
+                if tainted:
+                    self._tainted_keys.add(key)
+                else:
+                    # no cyclic edge influenced this subtree: the evidence
+                    # evaluation is identical on every endorsement path
+                    self._conclusion.setdefault(ckey, outcome)
+        if top_level:
+            self.outcomes[cert.fingerprint] = self._as_top_level(outcome)
+        else:
+            rkey = (cert.fingerprint, canon_time(evaluated_at))
+            # nested evaluations run in deterministic evidence order; the
+            # first conclusion for a given (responder, producedAt) is reported
+            self.responder_outcomes.setdefault(rkey, outcome)
         return outcome
 
     # -- internals ----------------------------------------------------------
@@ -527,8 +721,9 @@ class RevocationEvaluator:
         self.accounting[fp] = rec
         return rec
 
-    def _compute(self, cert: CertInfo, issuer: CertInfo) -> dict:
-        signed_at = self._signed_at
+    def _compute(self, cert: CertInfo, issuer: CertInfo,
+                 evaluated_at: datetime, path: tuple) -> dict:
+        signed_at = evaluated_at
         cutoff = self._cutoff
         evaluated: dict = {}
         views: list = []
@@ -645,9 +840,10 @@ class RevocationEvaluator:
             if single is None:
                 exclude(fp, "ocsp", "SERIAL_MISMATCH", "no single response for this certificate")
                 continue
-            ok, responder_desc, _rcert = _verify_ocsp_authorization(ocsp, issuer)
+            ok, responder_desc, _rcert, fail_reason = _verify_ocsp_authorization(
+                ocsp, issuer, self, path)
             if not ok:
-                exclude(fp, "ocsp", "RESPONDER_UNAUTHORIZED", responder_desc, is_defective=True)
+                exclude(fp, "ocsp", fail_reason, responder_desc, is_defective=True)
                 continue
             if single.status == "revoked" and single.revocation_time is None:
                 exclude(fp, "ocsp", "INVALID_REVOKED_ENTRY",
@@ -666,12 +862,16 @@ class RevocationEvaluator:
             })
 
         # ---- selection & conclusion ---------------------------------------
+        # every internal record uses ``evaluated_at``; the public top-level
+        # status() projects it onto the ``signed_at`` field path callers see.
         outcome = {
             "certificate": cert.fingerprint,
             "issuer_certificate": issuer.fingerprint,
-            "signed_at": canon_time(signed_at),
+            "evaluated_at": canon_time(signed_at),
             "knowledge_cutoff": canon_time(cutoff),
         }
+        if len(path) > 1:
+            outcome["responder_authorization"] = True
         if not views:
             outcome["status"] = "MALFORMED_EVIDENCE" if defective else "UNKNOWN"
             outcome["selected_view"] = None

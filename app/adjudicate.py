@@ -286,6 +286,15 @@ class _Engine:
         revocation = {
             fp: evaluator.outcomes[fp] for fp in sorted(evaluator.outcomes.keys())
         }
+        # delegated-responder certificates are adjudicated at the producedAt
+        # of the response they sign; record those intermediate conclusions too
+        responder_revocation = [
+            evaluator.responder_outcomes[key]
+            for key in sorted(
+                evaluator.responder_outcomes.keys(),
+                key=lambda k: (k[0], k[1]),
+            )
+        ]
         accounting = sorted(
             evaluator.accounting.values(), key=lambda r: (r["fingerprint"], r["reason"])
         )
@@ -304,6 +313,7 @@ class _Engine:
             "artifact_signature": artifact,
             "decision": decision,
             "revocation": revocation,
+            "responder_revocation": responder_revocation,
             "evidence_accounting": accounting,
             "summary": summary,
         }

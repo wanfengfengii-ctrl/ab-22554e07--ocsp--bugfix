@@ -199,22 +199,136 @@ def build_dataset():
     # OCSP: direct for leaf_ocsp (good), delegated responder for a second case
     objects.append(("ocsp:leaf-ocsp", make_ocsp(
         inter, serial=leaf_ocsp.cert.serial_number, status="good",
-        this_update=T("2024-05-20"), next_update=T("2024-06-20")), "ocsp",
+        this_update=T("2024-05-30"), next_update=T("2024-06-30")), "ocsp",
         "2024-06-15T00:00:00Z"))
     responder = make_leaf(inter, "OCSP Responder", "ec", not_before=T("2022-01-01"),
                           not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.9"])
     objects.append(("cert:responder", responder.der, "certificate", EARLY))
     d["responder"] = responder
+    # the delegated responder must itself be GOOD at the response producedAt;
+    # an empty issuer CRL covering that historical window (older than the
+    # 05-20 OCSP view so it never wins view selection for any leaf)
+    objects.append(("crl:responder-good", make_crl(
+        inter, entries=[], crl_number=6, this_update=T("2024-04-15"),
+        next_update=T("2024-07-01")), "crl", "2024-06-15T00:00:00Z"))
     objects.append(("ocsp:leaf-ok-delegated", make_ocsp(
         inter, serial=leaf_ok.cert.serial_number, status="good",
-        this_update=T("2024-05-20"), next_update=T("2024-06-20"),
-        responder=responder), "ocsp", "2024-06-15T00:00:00Z"))
+        this_update=T("2024-05-28"), next_update=T("2024-06-28"),
+        responder=responder, produced_at=T("2024-05-28")), "ocsp",
+        "2024-06-15T00:00:00Z"))
     # a late-archived CRL revoking leaf_ok (must be inadmissible)
     objects.append(("crl:late", make_crl(
         inter, entries=[(leaf_ok.cert.serial_number, T("2024-03-01"),
                          "keyCompromise")],
         crl_number=10, this_update=T("2024-05-25"), next_update=T("2024-07-01")),
         "crl", "2025-06-01T00:00:00Z"))
+
+    # ------------------------------------------------------------------
+    # Revoked-delegated-responder scenario, on an isolated CA so the main
+    # inter CRLs cannot vouch for the leaf.  The responder is revoked (CRL
+    # dated before the response producedAt); the CRL that proves it is stale
+    # for the leaf at signed_at, and the leaf's own CRL is stale too.
+    rr_root = make_ca("RR Root", "ec", not_before=T("2020-01-01"),
+                      not_after=T("2040-01-01"))
+    rr_inter = make_ca("RR Inter", "ec", issuer=rr_root, not_before=T("2021-01-01"),
+                       not_after=T("2035-01-01"))
+    leaf_rr = make_leaf(rr_inter, "Leaf RevokedResponder", "ed",
+                        not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                        eku=["1.3.6.1.5.5.7.3.3"])
+    rev_responder = make_leaf(rr_inter, "Revoked OCSP Responder", "ec",
+                              not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                              eku=["1.3.6.1.5.5.7.3.9"])
+    for e in (rr_root, rr_inter, leaf_rr, rev_responder):
+        objects.append((f"cert:{e.cn}:{sha256_hex(e.der)[:8]}", e.der,
+                        "certificate", EARLY))
+    d.update(rr_root=rr_root, rr_inter=rr_inter, leaf_rr=leaf_rr,
+             rev_responder=rev_responder)
+    # rr_inter is GOOD on the path via an empty root CRL
+    objects.append(("crl:rr-root", make_crl(
+        rr_root, entries=[], crl_number=1, this_update=T("2024-05-01"),
+        next_update=T("2024-07-01")), "crl", "2024-06-15T00:00:00Z"))
+    # the leaf's own CRL: stale at signed_at (window ends 2024-02-15)
+    rr_stale_crl = make_crl(rr_inter, entries=[], crl_number=1,
+                            this_update=T("2024-01-15"), next_update=T("2024-02-15"))
+    objects.append(("crl:rr-leaf-stale", rr_stale_crl, "crl",
+                    "2024-06-15T00:00:00Z"))
+    d["rr_stale_crl"] = rr_stale_crl
+    # archived CRL revoking the responder 2024-04-01; its window ends
+    # 2024-05-22 (stale for the leaf at signed_at) but it still proves the
+    # responder REVOKED at the response producedAt 2024-05-25
+    rr_resp_crl = make_crl(rr_inter, entries=[
+        (rev_responder.cert.serial_number, T("2024-04-01"), "keyCompromise"),
+    ], crl_number=2, this_update=T("2024-05-20"), next_update=T("2024-05-22"))
+    objects.append(("crl:rr-responder-revoked", rr_resp_crl, "crl",
+                    "2024-06-15T00:00:00Z"))
+    d["rr_resp_crl"] = rr_resp_crl
+    # delegated OCSP: window covers the signing time, claims the leaf GOOD,
+    # producedAt AFTER the responder revocation
+    rr_ocsp = make_ocsp(rr_inter, serial=leaf_rr.cert.serial_number, status="good",
+                        this_update=T("2024-05-20"), next_update=T("2024-07-01"),
+                        responder=rev_responder, produced_at=T("2024-05-25"))
+    objects.append(("ocsp:rr-leaf-good", rr_ocsp, "ocsp", "2024-06-15T00:00:00Z"))
+    d["rr_ocsp"] = rr_ocsp
+
+    # ------------------------------------------------------------------
+    # Responder self-/mutual-endorsement scenarios, again on an isolated CA
+    # with only a root CRL, so no independent evidence can rescue the leaves.
+    cy_root = make_ca("RespCycle Root", "ec", not_before=T("2020-01-01"),
+                      not_after=T("2040-01-01"))
+    cy_inter = make_ca("RespCycle Inter", "ec", issuer=cy_root,
+                       not_before=T("2021-01-01"), not_after=T("2035-01-01"))
+    leaf_self = make_leaf(cy_inter, "Leaf SelfResponder", "ed",
+                          not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                          eku=["1.3.6.1.5.5.7.3.3"])
+    self_responder = make_leaf(cy_inter, "Self OCSP Responder", "ec",
+                               not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                               eku=["1.3.6.1.5.5.7.3.9"])
+    leaf_mut = make_leaf(cy_inter, "Leaf MutualResponder", "ed",
+                         not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                         eku=["1.3.6.1.5.5.7.3.3"])
+    resp_a = make_leaf(cy_inter, "Mutual Responder A", "ec",
+                       not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                       eku=["1.3.6.1.5.5.7.3.9"])
+    resp_b = make_leaf(cy_inter, "Mutual Responder B", "ec",
+                       not_before=T("2022-01-01"), not_after=T("2030-01-01"),
+                       eku=["1.3.6.1.5.5.7.3.9"])
+    for e in (cy_root, cy_inter, leaf_self, self_responder, leaf_mut, resp_a, resp_b):
+        objects.append((f"cert:{e.cn}:{sha256_hex(e.der)[:8]}", e.der,
+                        "certificate", EARLY))
+    d.update(cy_root=cy_root, cy_inter=cy_inter, leaf_self=leaf_self,
+             self_responder=self_responder, leaf_mut=leaf_mut,
+             resp_a=resp_a, resp_b=resp_b)
+    objects.append(("crl:cy-root", make_crl(
+        cy_root, entries=[], crl_number=1, this_update=T("2024-05-01"),
+        next_update=T("2024-07-01")), "crl", "2024-06-15T00:00:00Z"))
+    # leaf vouched by self_responder; self_responder's own GOOD is claimed by
+    # an OCSP response signed by itself
+    objects.append(("ocsp:cy-leaf-self", make_ocsp(
+        cy_inter, serial=leaf_self.cert.serial_number, status="good",
+        this_update=T("2024-05-20"), next_update=T("2024-07-01"),
+        responder=self_responder, produced_at=T("2024-05-25")), "ocsp",
+        "2024-06-15T00:00:00Z"))
+    objects.append(("ocsp:cy-self-self", make_ocsp(
+        cy_inter, serial=self_responder.cert.serial_number, status="good",
+        this_update=T("2024-05-20"), next_update=T("2024-07-01"),
+        responder=self_responder, produced_at=T("2024-05-25")), "ocsp",
+        "2024-06-15T00:00:00Z"))
+    # mutual: leaf via A; A GOOD only via B; B GOOD only via A
+    objects.append(("ocsp:cy-leaf-mut", make_ocsp(
+        cy_inter, serial=leaf_mut.cert.serial_number, status="good",
+        this_update=T("2024-05-20"), next_update=T("2024-07-01"),
+        responder=resp_a, produced_at=T("2024-05-25")), "ocsp",
+        "2024-06-15T00:00:00Z"))
+    objects.append(("ocsp:cy-a-by-b", make_ocsp(
+        cy_inter, serial=resp_a.cert.serial_number, status="good",
+        this_update=T("2024-05-20"), next_update=T("2024-07-01"),
+        responder=resp_b, produced_at=T("2024-05-25")), "ocsp",
+        "2024-06-15T00:00:00Z"))
+    objects.append(("ocsp:cy-b-by-a", make_ocsp(
+        cy_inter, serial=resp_b.cert.serial_number, status="good",
+        this_update=T("2024-05-20"), next_update=T("2024-07-01"),
+        responder=resp_a, produced_at=T("2024-05-25")), "ocsp",
+        "2024-06-15T00:00:00Z"))
     return d, objects
 
 
@@ -342,6 +456,9 @@ def main():
         ("delta-revoked", d["leaf_delta"], [d["root_a"]], "INVALID"),
         ("cycle-leaf", d["leaf_cycle"], [d["root_a"]], "INVALID"),
         ("unsupported-leaf", d["leaf_unsup"], [d["root_a"]], "UNSUPPORTED"),
+        ("revoked-delegated-responder", d["leaf_rr"], [d["rr_root"]], "INVALID"),
+        ("responder-self-cycle", d["leaf_self"], [d["cy_root"]], "INVALID"),
+        ("responder-mutual-cycle", d["leaf_mut"], [d["cy_root"]], "INVALID"),
     ]
     results = {}
     for idx, (name, leaf, anchors, expected) in enumerate(cases):
@@ -371,6 +488,82 @@ def main():
     check("late evidence excluded", acct.get(late_fp, {}).get("reason") == "RECEIVED_AFTER_CUTOFF")
     check("late evidence did not change verdict",
           results["valid-cross-signed"]["verdict"] == "VALID")
+
+    # -- delegated responder: legal path still selected ---------------------
+    delegated = results["valid-cross-signed"]
+    leaf_ok_fp = sha256_hex(d["leaf_ok"].der)
+    delegated_view = delegated["revocation"][leaf_ok_fp]["selected_view"]
+    delegated_ocsp_fp = sha256_hex(
+        [o for o in objects if o[0] == "ocsp:leaf-ok-delegated"][0][1])
+    check("legal delegated OCSP is the selected leaf view",
+          delegated_view == f"ocsp:{delegated_ocsp_fp}", delegated_view)
+    dresp = {o["certificate"]: o for o in delegated["responder_revocation"]}
+    check("legal delegated responder GOOD at producedAt",
+          dresp.get(sha256_hex(d["responder"].der), {}).get("status") == "GOOD")
+
+    # direct issuer-signed OCSP regression
+    direct = results["ocsp-good"]
+    check("direct issuer OCSP selects an ocsp view",
+          direct["revocation"][sha256_hex(d["leaf_ocsp"].der)]["selected_view"]
+          .startswith("ocsp:"))
+
+    # -- revoked delegated responder: the reported vulnerability ------------
+    rr = results["revoked-delegated-responder"]
+    rr_leaf_fp = sha256_hex(d["leaf_rr"].der)
+    rr_out = rr["revocation"][rr_leaf_fp]
+    check("revoked-responder leaf is STALE", rr_out["status"] == "STALE",
+          json.dumps(rr_out)[:300])
+    check("revoked-responder leaf fell back to a stale CRL view",
+          rr_out["selected_view"].startswith("crl:"), rr_out["selected_view"])
+    rr_ocsp_fp = sha256_hex(d["rr_ocsp"])
+    check("the delegated OCSP is not the selected leaf evidence",
+          rr_ocsp_fp not in rr_out.get("selected_evidence", []))
+    rr_acct = {r["fingerprint"]: r for r in rr["evidence_accounting"]}
+    check("revoked-responder OCSP excluded with RESPONDER_REVOKED",
+          rr_acct.get(rr_ocsp_fp, {}).get("reason") == "RESPONDER_REVOKED",
+          json.dumps(rr_acct.get(rr_ocsp_fp)))
+    rr_resp_crl_fp = sha256_hex(d["rr_resp_crl"])
+    check("responder revocation CRL is accounted and used",
+          rr_acct.get(rr_resp_crl_fp, {}).get("disposition") == "used",
+          json.dumps(rr_acct.get(rr_resp_crl_fp)))
+    rr_resp = {o["certificate"]: o for o in rr["responder_revocation"]}
+    rr_resp_out = rr_resp.get(sha256_hex(d["rev_responder"].der), {})
+    check("responder adjudicated at producedAt (not signed_at/now)",
+          rr_resp_out.get("evaluated_at") == "2024-05-25T00:00:00Z"
+          and rr_resp_out.get("status") == "REVOKED"
+          and rr_resp_out.get("revocation_time") == "2024-04-01T00:00:00Z",
+          json.dumps(rr_resp_out)[:300])
+
+    # its pack must include the responder cert, the responder-revocation CRL
+    # and the rejected OCSP in the offline review object set, and verify cold
+    rr_pack_resp = requests.get(
+        f"{API_A}/v1/adjudications/{rr['adjudication_id']}/evidence-pack",
+        timeout=120)
+    check("revoked-responder pack download", rr_pack_resp.status_code == 200)
+    rr_pack = json.loads(rr_pack_resp.content)
+    rr_pack_fps = {o["fingerprint"] for o in rr_pack["objects"]}
+    check("offline set has responder cert",
+          sha256_hex(d["rev_responder"].der) in rr_pack_fps)
+    check("offline set has responder revocation CRL",
+          rr_resp_crl_fp in rr_pack_fps)
+    check("offline set has the rejected delegated OCSP", rr_ocsp_fp in rr_pack_fps)
+    with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as fh:
+        fh.write(rr_pack_resp.content)
+        rr_pack_path = fh.name
+    proc = subprocess.run([sys.executable, "-m", "app.verify", rr_pack_path],
+                          capture_output=True, text=True,
+                          cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    check("revoked-responder pack offline verification", proc.returncode == 0,
+          proc.stdout[-500:] + proc.stderr[-500:])
+
+    # -- responder self/mutual endorsement cycles ---------------------------
+    for cyc_name in ("responder-self-cycle", "responder-mutual-cycle"):
+        cyc = results[cyc_name]
+        reasons = {r["reason"] for r in cyc["evidence_accounting"]
+                   if r["type"] == "ocsp"}
+        check(f"{cyc_name}: cyclic OCSP rejected RESPONDER_CYCLE",
+              "RESPONDER_CYCLE" in reasons, json.dumps(sorted(reasons)))
+        check(f"{cyc_name}: verdict INVALID", cyc["verdict"] == "INVALID")
 
     # -- evidence pack + offline verification --------------------------------
     adj_id = results["valid-cross-signed"]["adjudication_id"]

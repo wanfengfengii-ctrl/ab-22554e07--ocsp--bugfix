@@ -147,8 +147,19 @@ SHA-256.  The response must be signed by the certificate's issuer directly,
 or by a delegated responder whose certificate is embedded in the response,
 is issued by the same issuer, verifies with the issuer's key, carries EKU
 `id-kp-OCSPSigning`, and is valid at the response's `producedAt`; the
-responderID (byKey SHA-1 or byName) must match the signer.  Unknown
-critical response/single-response extensions are `UNSUPPORTED`.
+responderID (byKey SHA-1 or byName) must match the signer.  A delegated
+responder is itself a certificate: its own revocation status is adjudicated
+at the response's `producedAt` (never at `signed_at` and never at the
+current time), through the same admissible evidence and the same
+`knowledge_cutoff`, and a responder that is `REVOKED`, `STALE`, `UNKNOWN` or
+otherwise not `GOOD` at `producedAt` cannot sign any admissible response
+(`RESPONDER_REVOKED` / `RESPONDER_UNAUTHORIZED`).  Recursive responder
+authorization is cycle-safe: a response whose signer is already on the
+current endorsement path (self-endorsement or two responders endorsing each
+other) is rejected (`RESPONDER_CYCLE`) without changing the deterministic
+result; the responder certificate and every evidence object its status draws
+on join the evidence accounting and the offline review object set.
+Unknown critical response/single-response extensions are `UNSUPPORTED`.
 
 ## Path building and selection
 
@@ -212,7 +223,11 @@ signature/authorization valid):
 Every evaluated evidence object is recorded in `evidence_accounting` with
 its disposition (`used` / `excluded`) and reason
 (`RECEIVED_AFTER_CUTOFF`, `SIGNATURE_INVALID`, `KEY_MISMATCH`,
-`RESPONDER_UNAUTHORIZED`, `UNSUPPORTED`, `NO_COMPATIBLE_BASE`, ...).
+`RESPONDER_UNAUTHORIZED`, `RESPONDER_REVOKED`, `RESPONDER_CYCLE`,
+`UNSUPPORTED`, `NO_COMPATIBLE_BASE`, ...).  This includes every object
+consulted while adjudicating a delegated responder at `producedAt`; the
+responder certificate itself and all such evidence objects are part of the
+evidence pack's offline review set.
 
 ## Canonicalization and tie-breaking
 
